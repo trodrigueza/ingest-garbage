@@ -536,11 +536,122 @@ def encode_example_image(path: str) -> str:
     return base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
+def list_image_files(dir_path: str) -> List[str]:
+    exts = {".jpg", ".jpeg", ".png"}
+    paths = [
+        str(p)
+        for p in sorted(Path(dir_path).iterdir())
+        if p.is_file() and p.suffix.lower() in exts
+    ]
+    return paths
+
+
+async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Dict[str, Any]:
+    """Procesa múltiples imágenes y genera un Excel consolidado."""
+    if not image_paths:
+        raise ValueError("No se proporcionaron imágenes para el batch.")
+    client = build_client(api_key)
+    config = PipelineConfig()
+    app = build_graph(config, client)
+
+    combined_rows: List[Dict[str, Any]] = []
+    resumen_rows: List[Dict[str, Any]] = []
+    inconsist_rows: List[Dict[str, Any]] = []
+    processed = 0
+
+    for img in image_paths:
+        LOGGER.info("Procesando archivo: %s", img)
+        try:
+            state: Dict[str, Any] = await app.ainvoke({"image_path": img, "attempt": 0})  # type: ignore[assignment]
+        except Exception as exc:  # pylint: disable=broad-except
+            LOGGER.error("Error procesando %s: %s", img, exc)
+            continue
+        planilla: Optional[PlanillaDigitalizada] = state.get("planilla")
+        if not planilla:
+            LOGGER.warning("Sin planilla para %s; se omite en consolidado.", img)
+            continue
+
+        # Marca de discrepancias
+        discrepancy_map: Dict[int, set] = {}
+        for d in state.get("discrepancies", []):
+            idx = d.get("fila_index")
+            campo = d.get("campo")
+            if isinstance(idx, int) and campo:
+                discrepancy_map.setdefault(idx, set()).add(campo)
+
+        def mark(val: Any, flagged: bool) -> Any:
+            if not flagged:
+                return val
+            if val is None:
+                return "*"
+            return f"{val}*"
+
+        for i, fila in enumerate(planilla.registros):
+            combined_rows.append(
+                {
+                    "archivo": Path(img).name,
+                    "mes": planilla.mes,
+                    "anio": planilla.anio,
+                    "semana": mark(fila.semana, "semana" in discrepancy_map.get(i, set())),
+                    "dia": mark(fila.dia, "dia" in discrepancy_map.get(i, set())),
+                    "fecha": mark(fila.fecha, "fecha" in discrepancy_map.get(i, set())),
+                    "kg_organicos": mark(fila.kg_organicos, "kg_organicos" in discrepancy_map.get(i, set())),
+                    "kg_reciclaje": mark(fila.kg_reciclaje, "kg_reciclaje" in discrepancy_map.get(i, set())),
+                    "kg_no_aprovechables": mark(
+                        fila.kg_no_aprovechables, "kg_no_aprovechables" in discrepancy_map.get(i, set())
+                    ),
+                    "notas": mark(fila.notas, "notas" in discrepancy_map.get(i, set())),
+                    "confianza_extraccion": planilla.confianza_extraccion,
+                }
+            )
+
+        resumen_rows.append(
+            {
+                "archivo": Path(img).name,
+                "mes": planilla.mes,
+                "anio": planilla.anio,
+                "observaciones_generales": planilla.observaciones_generales,
+                "confianza_extraccion": planilla.confianza_extraccion,
+                "auditoria": "\n".join(state.get("audit_notes", [])),
+                "excel_individual": state.get("excel_path", ""),
+                "needs_review": state.get("needs_review", False),
+            }
+        )
+
+        for d in state.get("discrepancies", []):
+            inconsist_rows.append(
+                {
+                    "archivo": Path(img).name,
+                    "fila": d.get("fila_index"),
+                    "campo": d.get("campo"),
+                    "valor_final": d.get("valor_final"),
+                    "valores_modelos": d.get("valores"),
+                }
+            )
+        processed += 1
+
+    if not combined_rows:
+        LOGGER.error("No se generó ningún registro consolidado.")
+        return {"excel_path": "", "processed": processed}
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    combined_path = config.output_dir / "planillas_consolidadas.xlsx"
+    with pd.ExcelWriter(combined_path) as writer:
+        pd.DataFrame(combined_rows).to_excel(writer, index=False, sheet_name="registros")
+        pd.DataFrame(resumen_rows).to_excel(writer, index=False, sheet_name="resumen")
+        if inconsist_rows:
+            pd.DataFrame(inconsist_rows).to_excel(writer, index=False, sheet_name="inconsistencias")
+
+    LOGGER.info("Exportado consolidado a Excel en %s", combined_path)
+    return {"excel_path": str(combined_path), "processed": processed}
+
+
 def cli():
     import argparse
 
     parser = argparse.ArgumentParser(description="Ingesta de planillas con Gemini 3.0")
-    parser.add_argument("image", help="Ruta a la imagen de la planilla (jpg/png).")
+    parser.add_argument("image", nargs="?", help="Ruta a la imagen de la planilla (jpg/png).")
+    parser.add_argument("--dir", dest="dir", help="Ruta a carpeta con imágenes (jpg/png) para procesar en batch.")
     parser.add_argument("--api-key", dest="api_key", help="API key de Google (opcional, usa GOOGLE_API_KEY).")
     parser.add_argument(
         "--model-pro",
@@ -567,6 +678,33 @@ def cli():
                 os.environ.setdefault("GENAI_FLASH_MODEL", args.model_flash or "")
             if args.model_pro_fallbacks:
                 os.environ["GENAI_PRO_FALLBACKS"] = args.model_pro_fallbacks
+            # Directorio explícito
+            if args.dir:
+                files = list_image_files(args.dir)
+                if not files:
+                    LOGGER.error("No se encontraron imágenes en %s", args.dir)
+                    return
+                result = await run_batch(files, api_key=args.api_key)
+                if result.get("excel_path"):
+                    LOGGER.info("Batch completado. Excel consolidado: %s", result["excel_path"])
+                else:
+                    LOGGER.error("Batch finalizado sin exportar.")
+                return
+            # Si el argumento principal es un directorio, trata como batch
+            if args.image and Path(args.image).is_dir():
+                files = list_image_files(args.image)
+                if not files:
+                    LOGGER.error("No se encontraron imágenes en %s", args.image)
+                    return
+                result = await run_batch(files, api_key=args.api_key)
+                if result.get("excel_path"):
+                    LOGGER.info("Batch completado. Excel consolidado: %s", result["excel_path"])
+                else:
+                    LOGGER.error("Batch finalizado sin exportar.")
+                return
+            if not args.image:
+                LOGGER.error("Debes proporcionar una imagen o un directorio.")
+                return
             state = await run_pipeline(args.image, api_key=args.api_key)
         except (ValidationError, RuntimeError) as exc:
             LOGGER.error("Error en la ingesta: %s", exc)

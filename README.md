@@ -49,6 +49,20 @@ Salida esperada:
 - Excel en `outputs/planilla_<mes>_<anio>.xlsx`.
 - Si no hay discrepancias entre modelos, no se añaden `*`. Los `*` indican campos con valores distintos entre extracciones.
 
+### Batch (carpeta con múltiples imágenes)
+```bash
+export GOOGLE_API_KEY="tu_api_key"
+python3.11 main.py --dir ./carpeta_imagenes \
+  --model-pro models/gemini-3-pro-preview \
+  --model-flash models/gemini-flash-latest
+# También puedes pasar el directorio como argumento principal:
+# python3.11 main.py ./carpeta_imagenes --model-pro ... --model-flash ...
+```
+Genera `outputs/planillas_consolidadas.xlsx` con:
+- `registros`: todas las filas de todas las imágenes (columna `archivo` incluida); celdas con discrepancias llevan `*`.
+- `resumen`: metadatos por archivo (confianza, observaciones, notas de auditoría).
+- `inconsistencias`: detalle de diferencias por campo/fila/modelo.
+
 ## Notas
 - Temperatura fija en 0.0 para reproducibilidad.
 - Si usas modelos sin soporte de JSON/schema (ej. `...flash-image`), recibirás 400; evita incluirlos en `GENAI_CONSENSUS_MODELS`.
