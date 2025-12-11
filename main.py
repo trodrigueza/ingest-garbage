@@ -424,7 +424,7 @@ def build_graph(config: PipelineConfig, client: genai.Client):
         config.output_dir.mkdir(parents=True, exist_ok=True)
         excel_path = config.output_dir / f"planilla_{planilla.mes}_{planilla.anio}.xlsx"
 
-        # Map discrepancies to mark cells with an asterisk
+        # Map de discrepancias por fila/campo
         discrepancy_map: Dict[int, set] = {}
         for d in state.get("discrepancies", []):
             idx = d.get("fila_index")
@@ -432,29 +432,24 @@ def build_graph(config: PipelineConfig, client: genai.Client):
             if isinstance(idx, int) and campo:
                 discrepancy_map.setdefault(idx, set()).add(campo)
 
-        def mark(val: Any, flagged: bool) -> Any:
-            if not flagged:
-                return val
-            if val is None:
-                return "*"
-            return f"{val}*"
-
-        rows = [
-            {
-                "semana": mark(fila.semana, "semana" in discrepancy_map.get(i, set())),
-                "dia": mark(fila.dia, "dia" in discrepancy_map.get(i, set())),
-                "fecha": mark(fila.fecha, "fecha" in discrepancy_map.get(i, set())),
-                "kg_organicos": mark(fila.kg_organicos, "kg_organicos" in discrepancy_map.get(i, set())),
-                "kg_reciclaje": mark(fila.kg_reciclaje, "kg_reciclaje" in discrepancy_map.get(i, set())),
-                "kg_no_aprovechables": mark(
-                    fila.kg_no_aprovechables, "kg_no_aprovechables" in discrepancy_map.get(i, set())
-                ),
-                "notas": mark(fila.notas, "notas" in discrepancy_map.get(i, set())),
+        rows = []
+        highlighted: List[tuple] = []  # (row_idx, col_name)
+        for i, fila in enumerate(planilla.registros):
+            fields = {
+                "semana": fila.semana,
+                "dia": fila.dia,
+                "fecha": fila.fecha,
+                "kg_organicos": fila.kg_organicos,
+                "kg_reciclaje": fila.kg_reciclaje,
+                "kg_no_aprovechables": fila.kg_no_aprovechables,
+                "notas": fila.notas,
             }
-            for i, fila in enumerate(planilla.registros)
-        ]
+            rows.append(fields)
+            for campo in discrepancy_map.get(i, set()):
+                highlighted.append((len(rows) - 1, campo))
+
         df = pd.DataFrame(rows)
-        with pd.ExcelWriter(excel_path) as writer:
+        with pd.ExcelWriter(excel_path, engine="xlsxwriter") as writer:
             df.to_excel(writer, index=False, sheet_name="registros")
             pd.DataFrame(
                 [
@@ -480,6 +475,18 @@ def build_graph(config: PipelineConfig, client: genai.Client):
                         for d in discrepancies
                     ]
                 ).to_excel(writer, index=False, sheet_name="inconsistencias")
+            # Resaltar celdas con discrepancias
+            if highlighted:
+                workbook = writer.book
+                worksheet = writer.sheets["registros"]
+                fmt = workbook.add_format({"bg_color": "#FFF3CD"})
+                col_indices = {name: idx for idx, name in enumerate(df.columns)}
+                for row_idx, col_name in highlighted:
+                    col_idx = col_indices.get(col_name)
+                    if col_idx is None:
+                        continue
+                    value = df.iloc[row_idx, col_idx]
+                    worksheet.write(row_idx + 1, col_idx, value, fmt)
         LOGGER.info("Exportado a Excel en %s", excel_path)
         return {**state, "excel_path": str(excel_path)}
 
@@ -557,6 +564,7 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
     combined_rows: List[Dict[str, Any]] = []
     resumen_rows: List[Dict[str, Any]] = []
     inconsist_rows: List[Dict[str, Any]] = []
+    highlighted_cells: List[tuple] = []  # (global_row_idx, col_name)
     processed = 0
 
     for img in image_paths:
@@ -580,12 +588,9 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
                 discrepancy_map.setdefault(idx, set()).add(campo)
 
         def mark(val: Any, flagged: bool) -> Any:
-            if not flagged:
-                return val
-            if val is None:
-                return "*"
-            return f"{val}*"
+            return val
 
+        start_idx = len(combined_rows)
         for i, fila in enumerate(planilla.registros):
             combined_rows.append(
                 {
@@ -604,6 +609,8 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
                     "confianza_extraccion": planilla.confianza_extraccion,
                 }
             )
+            for campo in discrepancy_map.get(i, set()):
+                highlighted_cells.append((start_idx + i, campo))
 
         resumen_rows.append(
             {
@@ -636,11 +643,23 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     combined_path = config.output_dir / "planillas_consolidadas.xlsx"
-    with pd.ExcelWriter(combined_path) as writer:
+    with pd.ExcelWriter(combined_path, engine="xlsxwriter") as writer:
         pd.DataFrame(combined_rows).to_excel(writer, index=False, sheet_name="registros")
         pd.DataFrame(resumen_rows).to_excel(writer, index=False, sheet_name="resumen")
         if inconsist_rows:
             pd.DataFrame(inconsist_rows).to_excel(writer, index=False, sheet_name="inconsistencias")
+        # Resaltar discrepancias
+        if highlighted_cells:
+            df = pd.DataFrame(combined_rows)
+            worksheet = writer.sheets["registros"]
+            fmt = writer.book.add_format({"bg_color": "#FFF3CD"})
+            col_indices = {name: idx for idx, name in enumerate(df.columns)}
+            for row_idx, col_name in highlighted_cells:
+                col_idx = col_indices.get(col_name)
+                if col_idx is None:
+                    continue
+                value = df.iloc[row_idx, col_idx]
+                worksheet.write(row_idx + 1, col_idx, value, fmt)
 
     LOGGER.info("Exportado consolidado a Excel en %s", combined_path)
     return {"excel_path": str(combined_path), "processed": processed}

@@ -63,6 +63,11 @@ Genera `outputs/planillas_consolidadas.xlsx` con:
 - `resumen`: metadatos por archivo (confianza, observaciones, notas de auditoría).
 - `inconsistencias`: detalle de diferencias por campo/fila/modelo.
 
+## Web UI mínima (Streamlit)
+- Requisitos extra: `pip install streamlit`.
+- Ejecuta: `streamlit run app.py`
+- En la UI ingresa la API Key, selecciona modelos (pro y flash), sube imágenes (jpg/png) y descarga el Excel consolidado.
+
 ## Notas
 - Temperatura fija en 0.0 para reproducibilidad.
 - Si usas modelos sin soporte de JSON/schema (ej. `...flash-image`), recibirás 400; evita incluirlos en `GENAI_CONSENSUS_MODELS`.
