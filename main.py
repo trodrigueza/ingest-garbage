@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
 import pandas as pd
+import fitz
 from google import genai
 from google.genai import types
 from google.genai import errors
@@ -48,6 +49,7 @@ class PlanillaDigitalizada(BaseModel):
 class PipelineState(TypedDict, total=False):
     image_path: str
     image_bytes: bytes
+    mime_type: str
     attempt: int
     enhance_contrast: bool
     planilla: PlanillaDigitalizada
@@ -124,7 +126,11 @@ Tu tarea: extraer la tabla al esquema JSON provisto (PlanillaDigitalizada) cumpl
 
 
 async def parse_planilla_with_gemini(
-    client: genai.Client, model: str, image_bytes: bytes, enhance_contrast: bool = False
+    client: genai.Client,
+    model: str,
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    enhance_contrast: bool = False,
 ) -> PlanillaDigitalizada:
     prompt = _vision_prompt(enhance_contrast)
     response = await asyncio.to_thread(
@@ -134,7 +140,7 @@ async def parse_planilla_with_gemini(
             types.Content(
                 role="user",
                 parts=[
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                     types.Part.from_text(text=prompt),
                 ],
             )
@@ -327,9 +333,11 @@ def build_graph(config: PipelineConfig, client: genai.Client):
 
     async def ingest_node(state: PipelineState) -> PipelineState:
         if "image_bytes" in state:
+            state["mime_type"] = state.get("mime_type", "image/jpeg")
             return state
         image_path = Path(state["image_path"])
         state["image_bytes"] = image_path.read_bytes()
+        state["mime_type"] = state.get("mime_type", infer_mime_type(image_path))
         return state
 
     async def vision_extraction_node(state: PipelineState) -> PipelineState:
@@ -353,7 +361,11 @@ def build_graph(config: PipelineConfig, client: genai.Client):
             for sub_try in range(per_model_attempts):
                 try:
                     planilla = await parse_planilla_with_gemini(
-                        client, model, state["image_bytes"], enhance_contrast=enhance
+                        client,
+                        model,
+                        state["image_bytes"],
+                        mime_type=state.get("mime_type", "image/jpeg"),
+                        enhance_contrast=enhance,
                     )
                     if planilla is None:
                         LOGGER.warning("Modelo %s devolvió resultado vacío", model)
@@ -530,6 +542,9 @@ def build_graph(config: PipelineConfig, client: genai.Client):
 # -------------------------
 
 async def run_pipeline(image_path: str, api_key: Optional[str] = None) -> PipelineState:
+    if Path(image_path).suffix.lower() == ".pdf":
+        result = await run_batch([image_path], api_key=api_key)
+        return {"excel_path": result.get("excel_path", ""), "processed": result.get("processed", 0)}
     client = build_client(api_key)
     config = PipelineConfig()
     app = build_graph(config, client)
@@ -543,8 +558,47 @@ def encode_example_image(path: str) -> str:
     return base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
 
+def infer_mime_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".png":
+        return "image/png"
+    if ext in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    return "image/jpeg"
+
+
+def render_pdf_to_jpeg_bytes(pdf_path: Path, zoom: float = 2.0) -> List[bytes]:
+    images: List[bytes] = []
+    matrix = fitz.Matrix(zoom, zoom)
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            images.append(pix.tobytes("jpeg"))
+    return images
+
+
+def build_input_items(path: Path) -> List[Dict[str, Any]]:
+    if path.suffix.lower() == ".pdf":
+        pages = render_pdf_to_jpeg_bytes(path)
+        return [
+            {
+                "label": f"{path.name}#page-{idx}",
+                "image_bytes": image_bytes,
+                "mime_type": "image/jpeg",
+            }
+            for idx, image_bytes in enumerate(pages, start=1)
+        ]
+    return [
+        {
+            "label": path.name,
+            "image_path": str(path),
+            "mime_type": infer_mime_type(path),
+        }
+    ]
+
+
 def list_image_files(dir_path: str) -> List[str]:
-    exts = {".jpg", ".jpeg", ".png"}
+    exts = {".jpg", ".jpeg", ".png", ".pdf"}
     paths = [
         str(p)
         for p in sorted(Path(dir_path).iterdir())
@@ -554,9 +608,9 @@ def list_image_files(dir_path: str) -> List[str]:
 
 
 async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Dict[str, Any]:
-    """Procesa múltiples imágenes y genera un Excel consolidado."""
+    """Procesa múltiples archivos (imágenes/PDF) y genera un Excel consolidado."""
     if not image_paths:
-        raise ValueError("No se proporcionaron imágenes para el batch.")
+        raise ValueError("No se proporcionaron archivos para el batch.")
     client = build_client(api_key)
     config = PipelineConfig()
     app = build_graph(config, client)
@@ -568,74 +622,92 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
     processed = 0
 
     for img in image_paths:
-        LOGGER.info("Procesando archivo: %s", img)
+        input_path = Path(img)
         try:
-            state: Dict[str, Any] = await app.ainvoke({"image_path": img, "attempt": 0})  # type: ignore[assignment]
+            items = build_input_items(input_path)
         except Exception as exc:  # pylint: disable=broad-except
-            LOGGER.error("Error procesando %s: %s", img, exc)
+            LOGGER.error("No se pudo preparar %s: %s", img, exc)
             continue
-        planilla: Optional[PlanillaDigitalizada] = state.get("planilla")
-        if not planilla:
-            LOGGER.warning("Sin planilla para %s; se omite en consolidado.", img)
+        if not items:
+            LOGGER.warning("Archivo sin páginas útiles: %s", img)
             continue
+        for item in items:
+            label = item["label"]
+            LOGGER.info("Procesando archivo: %s", label)
+            try:
+                state_input: Dict[str, Any] = {
+                    "image_path": item.get("image_path", label),
+                    "attempt": 0,
+                    "mime_type": item.get("mime_type", "image/jpeg"),
+                }
+                if "image_bytes" in item:
+                    state_input["image_bytes"] = item["image_bytes"]
+                state = await app.ainvoke(state_input)  # type: ignore[assignment]
+            except Exception as exc:  # pylint: disable=broad-except
+                LOGGER.error("Error procesando %s: %s", label, exc)
+                continue
+            planilla: Optional[PlanillaDigitalizada] = state.get("planilla")
+            if not planilla:
+                LOGGER.warning("Sin planilla para %s; se omite en consolidado.", label)
+                continue
 
         # Marca de discrepancias
-        discrepancy_map: Dict[int, set] = {}
-        for d in state.get("discrepancies", []):
-            idx = d.get("fila_index")
-            campo = d.get("campo")
-            if isinstance(idx, int) and campo:
-                discrepancy_map.setdefault(idx, set()).add(campo)
+            discrepancy_map: Dict[int, set] = {}
+            for d in state.get("discrepancies", []):
+                idx = d.get("fila_index")
+                campo = d.get("campo")
+                if isinstance(idx, int) and campo:
+                    discrepancy_map.setdefault(idx, set()).add(campo)
 
-        def mark(val: Any, flagged: bool) -> Any:
-            return val
+            def mark(val: Any, flagged: bool) -> Any:
+                return val
 
-        start_idx = len(combined_rows)
-        for i, fila in enumerate(planilla.registros):
-            combined_rows.append(
+            start_idx = len(combined_rows)
+            for i, fila in enumerate(planilla.registros):
+                combined_rows.append(
+                    {
+                        "archivo": label,
+                        "mes": planilla.mes,
+                        "anio": planilla.anio,
+                        "semana": mark(fila.semana, "semana" in discrepancy_map.get(i, set())),
+                        "dia": mark(fila.dia, "dia" in discrepancy_map.get(i, set())),
+                        "fecha": mark(fila.fecha, "fecha" in discrepancy_map.get(i, set())),
+                        "kg_organicos": mark(fila.kg_organicos, "kg_organicos" in discrepancy_map.get(i, set())),
+                        "kg_reciclaje": mark(fila.kg_reciclaje, "kg_reciclaje" in discrepancy_map.get(i, set())),
+                        "kg_no_aprovechables": mark(
+                            fila.kg_no_aprovechables, "kg_no_aprovechables" in discrepancy_map.get(i, set())
+                        ),
+                        "notas": mark(fila.notas, "notas" in discrepancy_map.get(i, set())),
+                        "confianza_extraccion": planilla.confianza_extraccion,
+                    }
+                )
+                for campo in discrepancy_map.get(i, set()):
+                    highlighted_cells.append((start_idx + i, campo))
+
+            resumen_rows.append(
                 {
-                    "archivo": Path(img).name,
+                    "archivo": label,
                     "mes": planilla.mes,
                     "anio": planilla.anio,
-                    "semana": mark(fila.semana, "semana" in discrepancy_map.get(i, set())),
-                    "dia": mark(fila.dia, "dia" in discrepancy_map.get(i, set())),
-                    "fecha": mark(fila.fecha, "fecha" in discrepancy_map.get(i, set())),
-                    "kg_organicos": mark(fila.kg_organicos, "kg_organicos" in discrepancy_map.get(i, set())),
-                    "kg_reciclaje": mark(fila.kg_reciclaje, "kg_reciclaje" in discrepancy_map.get(i, set())),
-                    "kg_no_aprovechables": mark(
-                        fila.kg_no_aprovechables, "kg_no_aprovechables" in discrepancy_map.get(i, set())
-                    ),
-                    "notas": mark(fila.notas, "notas" in discrepancy_map.get(i, set())),
+                    "observaciones_generales": planilla.observaciones_generales,
                     "confianza_extraccion": planilla.confianza_extraccion,
+                    "auditoria": "\n".join(state.get("audit_notes", [])),
+                    "excel_individual": state.get("excel_path", ""),
+                    "needs_review": state.get("needs_review", False),
                 }
             )
-            for campo in discrepancy_map.get(i, set()):
-                highlighted_cells.append((start_idx + i, campo))
 
-        resumen_rows.append(
-            {
-                "archivo": Path(img).name,
-                "mes": planilla.mes,
-                "anio": planilla.anio,
-                "observaciones_generales": planilla.observaciones_generales,
-                "confianza_extraccion": planilla.confianza_extraccion,
-                "auditoria": "\n".join(state.get("audit_notes", [])),
-                "excel_individual": state.get("excel_path", ""),
-                "needs_review": state.get("needs_review", False),
-            }
-        )
-
-        for d in state.get("discrepancies", []):
-            inconsist_rows.append(
-                {
-                    "archivo": Path(img).name,
-                    "fila": d.get("fila_index"),
-                    "campo": d.get("campo"),
-                    "valor_final": d.get("valor_final"),
-                    "valores_modelos": d.get("valores"),
-                }
-            )
-        processed += 1
+            for d in state.get("discrepancies", []):
+                inconsist_rows.append(
+                    {
+                        "archivo": label,
+                        "fila": d.get("fila_index"),
+                        "campo": d.get("campo"),
+                        "valor_final": d.get("valor_final"),
+                        "valores_modelos": d.get("valores"),
+                    }
+                )
+            processed += 1
 
     if not combined_rows:
         LOGGER.error("No se generó ningún registro consolidado.")
@@ -669,8 +741,12 @@ def cli():
     import argparse
 
     parser = argparse.ArgumentParser(description="Ingesta de planillas con Gemini 3.0")
-    parser.add_argument("image", nargs="?", help="Ruta a la imagen de la planilla (jpg/png).")
-    parser.add_argument("--dir", dest="dir", help="Ruta a carpeta con imágenes (jpg/png) para procesar en batch.")
+    parser.add_argument("image", nargs="?", help="Ruta a la imagen o PDF de la planilla (jpg/png/pdf).")
+    parser.add_argument(
+        "--dir",
+        dest="dir",
+        help="Ruta a carpeta con archivos (jpg/png/pdf) para procesar en batch.",
+    )
     parser.add_argument("--api-key", dest="api_key", help="API key de Google (opcional, usa GOOGLE_API_KEY).")
     parser.add_argument(
         "--model-pro",
@@ -701,7 +777,7 @@ def cli():
             if args.dir:
                 files = list_image_files(args.dir)
                 if not files:
-                    LOGGER.error("No se encontraron imágenes en %s", args.dir)
+                    LOGGER.error("No se encontraron archivos (jpg/png/pdf) en %s", args.dir)
                     return
                 result = await run_batch(files, api_key=args.api_key)
                 if result.get("excel_path"):
@@ -713,7 +789,7 @@ def cli():
             if args.image and Path(args.image).is_dir():
                 files = list_image_files(args.image)
                 if not files:
-                    LOGGER.error("No se encontraron imágenes en %s", args.image)
+                    LOGGER.error("No se encontraron archivos (jpg/png/pdf) en %s", args.image)
                     return
                 result = await run_batch(files, api_key=args.api_key)
                 if result.get("excel_path"):
@@ -722,7 +798,7 @@ def cli():
                     LOGGER.error("Batch finalizado sin exportar.")
                 return
             if not args.image:
-                LOGGER.error("Debes proporcionar una imagen o un directorio.")
+                LOGGER.error("Debes proporcionar una imagen/PDF o un directorio.")
                 return
             state = await run_pipeline(args.image, api_key=args.api_key)
         except (ValidationError, RuntimeError) as exc:

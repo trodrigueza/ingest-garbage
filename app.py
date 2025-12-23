@@ -24,7 +24,7 @@ def main():
     st.set_page_config(page_title="Ingesta de Planillas", page_icon="🗂️", layout="centered")
     st.title("Ingesta de Planillas de Basuras")
     st.write(
-        "Sube imágenes (jpg/png) de las planillas manuscritas. "
+        "Sube imágenes (jpg/png) o PDFs de las planillas manuscritas. "
         "El sistema ejecuta el pipeline con consenso multi-modelo y exporta un Excel consolidado."
     )
 
@@ -33,7 +33,9 @@ def main():
     model_flash = st.text_input("Modelo Flash (rápido)", value="models/gemini-flash-latest")
 
     uploaded = st.file_uploader(
-        "Sube una o varias imágenes", type=["jpg", "jpeg", "png"], accept_multiple_files=True
+        "Sube una o varias imágenes o PDFs",
+        type=["jpg", "jpeg", "png", "pdf"],
+        accept_multiple_files=True,
     )
 
     run_button = st.button("Procesar")
@@ -43,7 +45,7 @@ def main():
             st.error("Debes ingresar la API Key.")
             return
         if not uploaded:
-            st.error("Debes subir al menos una imagen.")
+            st.error("Debes subir al menos una imagen o PDF.")
             return
 
         with st.spinner("Procesando planillas..."):
