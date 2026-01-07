@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
@@ -21,6 +22,119 @@ LOGGER = logging.getLogger("planilla_ingesta")
 
 
 # -------------------------
+# Env helpers
+# -------------------------
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    LOGGER.warning("Valor inválido para %s=%s; usando default %s", name, value, default)
+    return default
+
+
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        LOGGER.warning("Valor inválido para %s=%s; usando default %s", name, value, default)
+        return default
+    if parsed < min_value:
+        LOGGER.warning("Valor fuera de rango para %s=%s; usando default %s", name, value, default)
+        return default
+    return parsed
+
+
+def _env_float(name: str, default: float, min_value: float = 0.1) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        LOGGER.warning("Valor inválido para %s=%s; usando default %s", name, value, default)
+        return default
+    if parsed < min_value:
+        LOGGER.warning("Valor fuera de rango para %s=%s; usando default %s", name, value, default)
+        return default
+    return parsed
+
+
+# -------------------------
+# Parsing helpers
+# -------------------------
+
+_KG_TOKENS = {
+    "kg",
+    "kgs",
+    "k",
+    "kilo",
+    "kilos",
+    "kilogramo",
+    "kilogramos",
+    "ki",
+}
+_GRAM_TOKENS = {
+    "g",
+    "gr",
+    "grs",
+    "gramo",
+    "gramos",
+}
+
+
+def _parse_weight_to_kg(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if text in {"", "-", "—", "–", "null", "none"}:
+        return None
+
+    tokens = set(re.findall(r"[a-z]+", text))
+    is_kg = bool(tokens & _KG_TOKENS)
+    is_grams = bool(tokens & _GRAM_TOKENS) and not is_kg
+
+    normalized = text.replace(",", ".")
+    mixed = re.search(r"(\d+)\s*[- ]\s*(\d+)\s*/\s*(\d+)", normalized)
+    if mixed:
+        whole = int(mixed.group(1))
+        num = int(mixed.group(2))
+        denom = int(mixed.group(3))
+        if denom == 0:
+            return None
+        number = whole + (num / denom)
+    else:
+        frac = re.search(r"(\d+)\s*/\s*(\d+)", normalized)
+        if frac:
+            num = int(frac.group(1))
+            denom = int(frac.group(2))
+            if denom == 0:
+                return None
+            number = num / denom
+        else:
+            match = re.search(r"[-+]?\d+(?:\.\d+)?", normalized)
+            if not match:
+                LOGGER.warning("No se pudo parsear valor kg: %s", value)
+                return None
+            number = float(match.group(0))
+
+    if is_grams:
+        number = number / 1000.0
+    return number
+
+
+# -------------------------
 # Pydantic models (schema control)
 # -------------------------
 
@@ -32,6 +146,11 @@ class FilaResiduo(BaseModel):
     kg_reciclaje: Optional[float] = Field(None, description="Valor numérico bolsa blanca. Null si vacío.")
     kg_no_aprovechables: Optional[float] = Field(None, description="Valor numérico. Null si vacío.")
     notas: Optional[str] = Field(None, description="Cualquier texto manuscrito adicional.")
+
+    @field_validator("kg_organicos", "kg_reciclaje", "kg_no_aprovechables", mode="before")
+    @classmethod
+    def normalize_kg(cls, value: Any) -> Optional[float]:
+        return _parse_weight_to_kg(value)
 
 
 class PlanillaDigitalizada(BaseModel):
@@ -72,6 +191,10 @@ class PipelineConfig:
     model_flash: str = os.environ.get("GENAI_FLASH_MODEL", "models/gemini-flash-latest")
     model_pro_fallbacks: List[str] = None  # type: ignore[assignment]
     consensus_models: List[str] = None  # type: ignore[assignment]
+    per_model_attempts: int = 1
+    retry_on_anomaly: bool = False
+    pdf_zoom: float = 1.3
+    batch_concurrency: int = 3
 
     def __post_init__(self):
         if self.model_pro_fallbacks is None:
@@ -91,8 +214,12 @@ class PipelineConfig:
             if env_models:
                 self.consensus_models = [m.strip() for m in env_models.split(",") if m.strip()]
             else:
-                # Secuencia: 1 pasada pro (thinking) y 1 pasada 2.5-pro para contraste
-                self.consensus_models = [self.model_pro, "models/gemini-2.5-pro"]
+                # Default: una sola pasada para acelerar; configura GENAI_CONSENSUS_MODELS si quieres consenso
+                self.consensus_models = [self.model_pro]
+        self.per_model_attempts = _env_int("GENAI_MODEL_ATTEMPTS", self.per_model_attempts, min_value=1)
+        self.retry_on_anomaly = _env_bool("GENAI_RETRY_ON_ANOMALY", self.retry_on_anomaly)
+        self.pdf_zoom = _env_float("GENAI_PDF_ZOOM", self.pdf_zoom, min_value=0.5)
+        self.batch_concurrency = _env_int("GENAI_BATCH_CONCURRENCY", self.batch_concurrency, min_value=1)
 
 
 # -------------------------
@@ -113,6 +240,9 @@ Tu tarea: extraer la tabla al esquema JSON provisto (PlanillaDigitalizada) cumpl
 - Identifica cabecera Mes/Año y usa esos valores en el JSON.
 - Encabezados lógicos: Semana, Día, Fecha, Kg Orgánicos (bolsa verde), Kg Reciclaje (bolsa blanca), Kg No aprovechables, Notas.
 - Números: escribe solo el valor numérico, ignora palabras como "kilo", "kilos", "k". Ej: "14 Kilos" -> 14.
+- Unidades: si el valor está en gramos ("g", "gramo", "gramos"), conviértelo a kg (divide entre 1000) antes de escribirlo.
+- Decimales: acepta "4.5 kg" o fracciones como "4 1/2 kg" y conviértelo a decimal; escribe el decimal con coma (ej: 4.5 -> "4,5").
+- Si el "Kg" está mal escrito (ej: "Ki"), asúmelo como Kg.
 - Celdas vacías o con guiones: deja el campo como null.
 - Texto especial (ej: "Festivo"): ubícalo en la primera columna de kilos disponible para ese día y deja las otras vacías, o en notas si no encaja.
 - No inventes valores; respeta tachaduras o correcciones manuscritas.
@@ -357,7 +487,7 @@ def build_graph(config: PipelineConfig, client: genai.Client):
             models_to_try.append(m)
         extractions: List[Dict[str, Any]] = []
         for model in models_to_try:
-            per_model_attempts = 2
+            per_model_attempts = config.per_model_attempts
             for sub_try in range(per_model_attempts):
                 try:
                     planilla = await parse_planilla_with_gemini(
@@ -412,7 +542,7 @@ def build_graph(config: PipelineConfig, client: genai.Client):
             audit_notes.append(summary)
         needs_review = bool(anomalies)
         review_reason = "; ".join(anomalies) if anomalies else ""
-        if needs_review and state.get("attempt", 1) < 2:
+        if needs_review and config.retry_on_anomaly and state.get("attempt", 1) < 2:
             LOGGER.info("Se detectaron anomalías. Reintentando con mejora de contraste.")
             return {
                 **state,
@@ -567,7 +697,7 @@ def infer_mime_type(path: Path) -> str:
     return "image/jpeg"
 
 
-def render_pdf_to_jpeg_bytes(pdf_path: Path, zoom: float = 2.0) -> List[bytes]:
+def render_pdf_to_jpeg_bytes(pdf_path: Path, zoom: float) -> List[bytes]:
     images: List[bytes] = []
     matrix = fitz.Matrix(zoom, zoom)
     with fitz.open(pdf_path) as doc:
@@ -577,9 +707,9 @@ def render_pdf_to_jpeg_bytes(pdf_path: Path, zoom: float = 2.0) -> List[bytes]:
     return images
 
 
-def build_input_items(path: Path) -> List[Dict[str, Any]]:
+def build_input_items(path: Path, pdf_zoom: float) -> List[Dict[str, Any]]:
     if path.suffix.lower() == ".pdf":
-        pages = render_pdf_to_jpeg_bytes(path)
+        pages = render_pdf_to_jpeg_bytes(path, zoom=pdf_zoom)
         return [
             {
                 "label": f"{path.name}#page-{idx}",
@@ -621,18 +751,29 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
     highlighted_cells: List[tuple] = []  # (global_row_idx, col_name)
     processed = 0
 
+    work_items: List[Dict[str, Any]] = []
     for img in image_paths:
         input_path = Path(img)
         try:
-            items = build_input_items(input_path)
+            items = build_input_items(input_path, pdf_zoom=config.pdf_zoom)
         except Exception as exc:  # pylint: disable=broad-except
             LOGGER.error("No se pudo preparar %s: %s", img, exc)
             continue
         if not items:
             LOGGER.warning("Archivo sin páginas útiles: %s", img)
             continue
-        for item in items:
-            label = item["label"]
+        work_items.extend(items)
+
+    if not work_items:
+        LOGGER.error("No se generó ningún registro consolidado.")
+        return {"excel_path": "", "processed": processed}
+
+    concurrency = max(1, config.batch_concurrency)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def process_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        label = item["label"]
+        async with semaphore:
             LOGGER.info("Procesando archivo: %s", label)
             try:
                 state_input: Dict[str, Any] = {
@@ -645,69 +786,80 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
                 state = await app.ainvoke(state_input)  # type: ignore[assignment]
             except Exception as exc:  # pylint: disable=broad-except
                 LOGGER.error("Error procesando %s: %s", label, exc)
-                continue
-            planilla: Optional[PlanillaDigitalizada] = state.get("planilla")
-            if not planilla:
-                LOGGER.warning("Sin planilla para %s; se omite en consolidado.", label)
-                continue
+                return None
+        return {"item": item, "state": state}
+
+    tasks = [asyncio.create_task(process_item(item)) for item in work_items]
+    results = await asyncio.gather(*tasks)
+
+    for result in results:
+        if not result:
+            continue
+        item = result["item"]
+        state = result["state"]
+        label = item["label"]
+        planilla: Optional[PlanillaDigitalizada] = state.get("planilla")
+        if not planilla:
+            LOGGER.warning("Sin planilla para %s; se omite en consolidado.", label)
+            continue
 
         # Marca de discrepancias
-            discrepancy_map: Dict[int, set] = {}
-            for d in state.get("discrepancies", []):
-                idx = d.get("fila_index")
-                campo = d.get("campo")
-                if isinstance(idx, int) and campo:
-                    discrepancy_map.setdefault(idx, set()).add(campo)
+        discrepancy_map: Dict[int, set] = {}
+        for d in state.get("discrepancies", []):
+            idx = d.get("fila_index")
+            campo = d.get("campo")
+            if isinstance(idx, int) and campo:
+                discrepancy_map.setdefault(idx, set()).add(campo)
 
-            def mark(val: Any, flagged: bool) -> Any:
-                return val
+        def mark(val: Any, flagged: bool) -> Any:
+            return val
 
-            start_idx = len(combined_rows)
-            for i, fila in enumerate(planilla.registros):
-                combined_rows.append(
-                    {
-                        "archivo": label,
-                        "mes": planilla.mes,
-                        "anio": planilla.anio,
-                        "semana": mark(fila.semana, "semana" in discrepancy_map.get(i, set())),
-                        "dia": mark(fila.dia, "dia" in discrepancy_map.get(i, set())),
-                        "fecha": mark(fila.fecha, "fecha" in discrepancy_map.get(i, set())),
-                        "kg_organicos": mark(fila.kg_organicos, "kg_organicos" in discrepancy_map.get(i, set())),
-                        "kg_reciclaje": mark(fila.kg_reciclaje, "kg_reciclaje" in discrepancy_map.get(i, set())),
-                        "kg_no_aprovechables": mark(
-                            fila.kg_no_aprovechables, "kg_no_aprovechables" in discrepancy_map.get(i, set())
-                        ),
-                        "notas": mark(fila.notas, "notas" in discrepancy_map.get(i, set())),
-                        "confianza_extraccion": planilla.confianza_extraccion,
-                    }
-                )
-                for campo in discrepancy_map.get(i, set()):
-                    highlighted_cells.append((start_idx + i, campo))
-
-            resumen_rows.append(
+        start_idx = len(combined_rows)
+        for i, fila in enumerate(planilla.registros):
+            combined_rows.append(
                 {
                     "archivo": label,
                     "mes": planilla.mes,
                     "anio": planilla.anio,
-                    "observaciones_generales": planilla.observaciones_generales,
+                    "semana": mark(fila.semana, "semana" in discrepancy_map.get(i, set())),
+                    "dia": mark(fila.dia, "dia" in discrepancy_map.get(i, set())),
+                    "fecha": mark(fila.fecha, "fecha" in discrepancy_map.get(i, set())),
+                    "kg_organicos": mark(fila.kg_organicos, "kg_organicos" in discrepancy_map.get(i, set())),
+                    "kg_reciclaje": mark(fila.kg_reciclaje, "kg_reciclaje" in discrepancy_map.get(i, set())),
+                    "kg_no_aprovechables": mark(
+                        fila.kg_no_aprovechables, "kg_no_aprovechables" in discrepancy_map.get(i, set())
+                    ),
+                    "notas": mark(fila.notas, "notas" in discrepancy_map.get(i, set())),
                     "confianza_extraccion": planilla.confianza_extraccion,
-                    "auditoria": "\n".join(state.get("audit_notes", [])),
-                    "excel_individual": state.get("excel_path", ""),
-                    "needs_review": state.get("needs_review", False),
                 }
             )
+            for campo in discrepancy_map.get(i, set()):
+                highlighted_cells.append((start_idx + i, campo))
 
-            for d in state.get("discrepancies", []):
-                inconsist_rows.append(
-                    {
-                        "archivo": label,
-                        "fila": d.get("fila_index"),
-                        "campo": d.get("campo"),
-                        "valor_final": d.get("valor_final"),
-                        "valores_modelos": d.get("valores"),
-                    }
-                )
-            processed += 1
+        resumen_rows.append(
+            {
+                "archivo": label,
+                "mes": planilla.mes,
+                "anio": planilla.anio,
+                "observaciones_generales": planilla.observaciones_generales,
+                "confianza_extraccion": planilla.confianza_extraccion,
+                "auditoria": "\n".join(state.get("audit_notes", [])),
+                "excel_individual": state.get("excel_path", ""),
+                "needs_review": state.get("needs_review", False),
+            }
+        )
+
+        for d in state.get("discrepancies", []):
+            inconsist_rows.append(
+                {
+                    "archivo": label,
+                    "fila": d.get("fila_index"),
+                    "campo": d.get("campo"),
+                    "valor_final": d.get("valor_final"),
+                    "valores_modelos": d.get("valores"),
+                }
+            )
+        processed += 1
 
     if not combined_rows:
         LOGGER.error("No se generó ningún registro consolidado.")

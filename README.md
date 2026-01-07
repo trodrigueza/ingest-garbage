@@ -4,17 +4,22 @@ Pipeline asíncrono en Python para digitalizar planillas manuscritas usando **go
 
 ## Requisitos
 - Python 3.11+ (3.12 recomendado).
-- Dependencias: `pip install google-genai langgraph pydantic pandas`.
+- Dependencias: `pip install google-genai langgraph pydantic pandas pymupdf`.
 - Variables de entorno:
   - `GOOGLE_API_KEY` (o `GENAI_API_KEY`): clave de Gemini.
-  - Opcional: `GENAI_CONSENSUS_MODELS` para definir el orden de modelos en consenso (coma-separado).
+  - Opcionales:
+    - `GENAI_CONSENSUS_MODELS` para definir el orden de modelos en consenso (coma-separado).
+    - `GENAI_MODEL_ATTEMPTS` número de intentos por modelo (default: 1).
+    - `GENAI_RETRY_ON_ANOMALY` reintento por anomalías en sanity check (default: false).
+    - `GENAI_PDF_ZOOM` escala de render para PDFs (default: 1.3).
+    - `GENAI_BATCH_CONCURRENCY` concurrencia máxima en batch (default: 3).
 
 ## Modelos
-- Por defecto, consenso en dos pasadas: `models/gemini-3-pro-preview` y `models/gemini-2.5-pro`.
+- Por defecto, una sola pasada con `models/gemini-3-pro-preview` para acelerar.
 - Puedes sobreescribir:
   - `--model-pro` (thinking) p.ej. `models/gemini-3-pro-preview`.
   - `--model-flash` (rápido) p.ej. `models/gemini-flash-latest`.
-  - `GENAI_CONSENSUS_MODELS` si quieres un orden explícito (no se deduplica). Ejemplo:
+  - `GENAI_CONSENSUS_MODELS` si quieres consenso multi-modelo (no se deduplica). Ejemplo:
     ```bash
     export GENAI_CONSENSUS_MODELS="models/gemini-3-pro-preview,models/gemini-2.5-pro,models/gemini-flash-latest"
     ```
@@ -29,10 +34,10 @@ El prompt integrado indica:
 - No inventar; respetar tachaduras/correcciones. Segunda pasada opcional con “mejor contraste” si hay anomalías.
 
 ## Flujo (LangGraph)
-1. **Ingesta**: lee la imagen.
+1. **Ingesta**: lee la imagen o renderiza páginas de PDF.
 2. **VisionExtraction**: llama a Gemini según `consensus_models` (secuencial, reintento simple). Se omiten modelos sin soporte de `response_schema`.
 3. **Consensus**: compara salidas, arma un `PlanillaDigitalizada` final y registra discrepancias (por campo/fila). Si los valores difieren, ese campo se marca con `*` en la exportación.
-4. **SanityCheck**: verifica confianza < 0.8, duplicados de fecha (ignorando vacías) y outliers numéricos; si falla y no hubo reintento, activa mejora de contraste y vuelve a extracción; tras reintento, exporta igualmente.
+4. **SanityCheck**: verifica confianza < 0.8, duplicados de fecha (ignorando vacías) y outliers numéricos; si falla y `GENAI_RETRY_ON_ANOMALY` está activo, reintenta con mejora de contraste; si no, exporta igualmente.
 5. **Export**: genera `outputs/planilla_<mes>_<anio>.xlsx` con hojas:
    - `registros`: datos; campos con discrepancias llevan `*`.
    - `resumen`: metadatos y notas de auditoría.
@@ -41,7 +46,7 @@ El prompt integrado indica:
 ## Uso
 ```bash
 export GOOGLE_API_KEY="tu_api_key"
-python3.11 main.py <ruta_imagen> \
+python3.11 main.py <ruta_imagen_o_pdf> \
   --model-pro models/gemini-3-pro-preview \
   --model-flash models/gemini-flash-latest
 ```
@@ -49,7 +54,7 @@ Salida esperada:
 - Excel en `outputs/planilla_<mes>_<anio>.xlsx`.
 - Si no hay discrepancias entre modelos, no se añaden `*`. Los `*` indican campos con valores distintos entre extracciones.
 
-### Batch (carpeta con múltiples imágenes)
+### Batch (carpeta con múltiples archivos)
 ```bash
 export GOOGLE_API_KEY="tu_api_key"
 python3.11 main.py --dir ./carpeta_imagenes \
@@ -59,14 +64,15 @@ python3.11 main.py --dir ./carpeta_imagenes \
 # python3.11 main.py ./carpeta_imagenes --model-pro ... --model-flash ...
 ```
 Genera `outputs/planillas_consolidadas.xlsx` con:
-- `registros`: todas las filas de todas las imágenes (columna `archivo` incluida); celdas con discrepancias llevan `*`.
+- `registros`: todas las filas de todas las imágenes/PDFs (columna `archivo` incluida); celdas con discrepancias llevan `*`.
 - `resumen`: metadatos por archivo (confianza, observaciones, notas de auditoría).
 - `inconsistencias`: detalle de diferencias por campo/fila/modelo.
+Nota: los PDFs se renderizan por página y se listan como `archivo.pdf#page-N`.
 
 ## Web UI mínima (Streamlit)
 - Requisitos extra: `pip install streamlit`.
 - Ejecuta: `streamlit run app.py`
-- En la UI ingresa la API Key, selecciona modelos (pro y flash), sube imágenes (jpg/png) y descarga el Excel consolidado.
+- En la UI ingresa la API Key, selecciona modelos (pro y flash), sube imágenes (jpg/png) o PDFs y descarga el Excel consolidado.
 
 ## Notas
 - Temperatura fija en 0.0 para reproducibilidad.
