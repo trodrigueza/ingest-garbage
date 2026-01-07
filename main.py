@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 import pandas as pd
 import fitz
@@ -737,7 +737,11 @@ def list_image_files(dir_path: str) -> List[str]:
     return paths
 
 
-async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Dict[str, Any]:
+async def run_batch(
+    image_paths: List[str],
+    api_key: Optional[str] = None,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
     """Procesa múltiples archivos (imágenes/PDF) y genera un Excel consolidado."""
     if not image_paths:
         raise ValueError("No se proporcionaron archivos para el batch.")
@@ -771,8 +775,10 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
     concurrency = max(1, config.batch_concurrency)
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def process_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def process_item(index: int, item: Dict[str, Any]) -> Dict[str, Any]:
         label = item["label"]
+        if progress_cb:
+            progress_cb(f"Procesando {label}...")
         async with semaphore:
             LOGGER.info("Procesando archivo: %s", label)
             try:
@@ -786,18 +792,46 @@ async def run_batch(image_paths: List[str], api_key: Optional[str] = None) -> Di
                 state = await app.ainvoke(state_input)  # type: ignore[assignment]
             except Exception as exc:  # pylint: disable=broad-except
                 LOGGER.error("Error procesando %s: %s", label, exc)
-                return None
-        return {"item": item, "state": state}
+                if progress_cb:
+                    progress_cb(f"Fallo procesando {label}: {exc}")
+                return {"index": index, "item": item, "state": None}
+        return {"index": index, "item": item, "state": state}
 
-    tasks = [asyncio.create_task(process_item(item)) for item in work_items]
-    results = await asyncio.gather(*tasks)
+    tasks = [asyncio.create_task(process_item(idx, item)) for idx, item in enumerate(work_items)]
+    results_by_index: List[Optional[Dict[str, Any]]] = [None] * len(tasks)
 
-    for result in results:
+    for coro in asyncio.as_completed(tasks):
+        result = await coro
+        if not result:
+            continue
+        results_by_index[result["index"]] = result
+        state = result.get("state")
+        item = result["item"]
+        label = item["label"]
+        if not state:
+            continue
+        planilla: Optional[PlanillaDigitalizada] = state.get("planilla")
+        if progress_cb:
+            if not planilla:
+                progress_cb(f"Sin planilla para {label}; se omite.")
+            else:
+                month_label = f"{planilla.mes} {planilla.anio}"
+                if state.get("needs_review"):
+                    progress_cb(f"{month_label} marcada para revisión")
+                else:
+                    progress_cb(f"{month_label} procesado correctamente")
+                excel_path = state.get("excel_path")
+                if excel_path:
+                    progress_cb(f"Exportado a Excel en {excel_path}")
+
+    for result in results_by_index:
         if not result:
             continue
         item = result["item"]
         state = result["state"]
         label = item["label"]
+        if not state:
+            continue
         planilla: Optional[PlanillaDigitalizada] = state.get("planilla")
         if not planilla:
             LOGGER.warning("Sin planilla para %s; se omite en consolidado.", label)

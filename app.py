@@ -28,6 +28,7 @@ def clear_previous_result() -> None:
         "last_processed",
         "last_elapsed",
         "last_error",
+        "progress_logs",
     ):
         st.session_state.pop(key, None)
 
@@ -63,10 +64,25 @@ def main():
         on_change=clear_previous_result,
     )
 
+    progress_placeholder = st.empty()
+
+    def add_log(message: str) -> None:
+        logs = st.session_state.setdefault("progress_logs", [])
+        logs.append(message)
+        if len(logs) > 50:
+            logs.pop(0)
+        progress_placeholder.markdown("\n".join(f"- {line}" for line in logs))
+
+    if st.session_state.get("progress_logs"):
+        progress_placeholder.markdown(
+            "\n".join(f"- {line}" for line in st.session_state["progress_logs"])
+        )
+
     run_button = st.button("Procesar")
 
     if run_button:
         clear_previous_result()
+        progress_placeholder.empty()
         if not api_key:
             st.error("Debes ingresar la API Key.")
             return
@@ -79,7 +95,7 @@ def main():
             paths = save_uploads(uploaded)
             # Opcional: permitir leer carpeta entera (por si se usa como entrada)
             # paths = list_image_files(<dir>) si se prefiere.
-            result = asyncio.run(run_batch(paths, api_key=api_key))
+            result = asyncio.run(run_batch(paths, api_key=api_key, progress_cb=add_log))
             elapsed = time.perf_counter() - start
 
         if result.get("excel_path"):
@@ -88,6 +104,7 @@ def main():
             st.session_state["last_excel_name"] = excel_path.name
             st.session_state["last_processed"] = result.get("processed", 0)
             st.session_state["last_elapsed"] = elapsed
+            add_log(f"Exportado consolidado a Excel en {excel_path}")
         else:
             st.session_state["last_error"] = "No se generó el Excel consolidado. Revisa los logs para más detalle."
 
